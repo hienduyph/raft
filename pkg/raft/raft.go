@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	"math/rand"
@@ -10,13 +12,24 @@ import (
 	"time"
 )
 
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}) *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := &ConsensusModule{
-		id:       id,
-		peerIds:  peerIds,
-		server:   server,
-		state:    Follower,
-		votedFor: -1,
+		id:                 id,
+		peerIds:            peerIds,
+		server:             server,
+		storage:            storage,
+		state:              Follower,
+		commitChan:         commitChan,
+		triggerChan:        make(chan struct{}, 1),
+		newCommitReadyChan: make(chan struct{}, 16),
+		votedFor:           -1,
+		commitIndex:        -1,
+		lastApplied:        -1,
+		nextIndex:          make(map[int]int),
+		matchIndex:         make(map[int]int),
+	}
+	if cm.storage.HasData() {
+		cm.restoreFromState(cm.storage)
 	}
 	go func() {
 		<-ready
@@ -35,6 +48,9 @@ type ConsensusModule struct {
 	peerIds []int
 	server  *Server
 
+	// persistent
+	storage Storage
+
 	// commitChan is the channel where this Cm is going to report commited log
 	// entries. It's passed in by the client during construction
 	commitChan chan<- CommitEntry
@@ -42,6 +58,10 @@ type ConsensusModule struct {
 	// that commitn new entries to the log to notify that these entries may be sent
 	// on commitChan
 	newCommitReadyChan chan struct{}
+
+	// triggerChan is an internal notification channel used to triggerChan
+	// sending new AEs to followers when interesting changes occurred
+	triggerChan chan struct{}
 
 	currentTerm int
 	votedFor    int
@@ -146,13 +166,16 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 // implement command and log replication
 func (cm *ConsensusModule) Submit(command interface{}) bool {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
 	cm.dlog("Submit received by %v:%v", cm.state, command)
 	if cm.state == Leader {
 		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
+		cm.persistToStorage()
 		cm.dlog("... log=%v", cm.log)
+		cm.mu.Unlock()
+		cm.triggerChan <- struct{}{}
 		return true
 	}
+	cm.mu.Unlock()
 	return false
 }
 
@@ -267,25 +290,51 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
-	cm.dlog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
+	for _, peerId := range cm.peerIds {
+		cm.nextIndex[peerId] = len(cm.log)
+		cm.matchIndex[peerId] = -1
+	}
+	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v, log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
 	// start heart beat
-	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
+	go func(heartBeatTimeout time.Duration) {
+		cm.leaderSendAEs()
+		ticker := time.NewTimer(heartBeatTimeout)
 		defer ticker.Stop()
 		for {
-			cm.leaderSendHeartbeats()
-			<-ticker.C
+			doSend := false
+			select {
+			case <-ticker.C:
+				doSend = true
+				ticker.Stop()
+				ticker.Reset(heartBeatTimeout)
+			case _, ok := <-cm.triggerChan:
+				if ok {
+					doSend = true
+				} else {
+					return
+				}
+				// reset for heartbeat
+				if !ticker.Stop() {
+					<-ticker.C
+				}
+				ticker.Reset(heartBeatTimeout)
+			}
+
+			if !doSend {
+				continue
+			}
 			cm.mu.Lock()
 			if cm.state != Leader {
 				cm.mu.Unlock()
 				return
 			}
 			cm.mu.Unlock()
+			cm.leaderSendAEs()
 		}
-	}()
+	}(50 * time.Millisecond)
 }
 
-func (cm *ConsensusModule) leaderSendHeartbeats() {
+func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
@@ -326,7 +375,23 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			return
 		}
 		if !reply.Success {
-			return
+			// resolve conflict
+			if reply.ConflictTerm < 0 {
+				cm.nextIndex[peerId] = reply.ConflictIndex
+				return
+			}
+			lastIndexOfTerm := -1
+			for i := len(cm.log) - 1; i >= 0; i-- {
+				if cm.log[i].Term == reply.ConflictTerm {
+					lastIndexOfTerm = i
+					break
+				}
+			}
+			if lastIndexOfTerm >= 0 {
+				cm.nextIndex[peerId] = lastIndexOfTerm + 1
+			} else {
+				cm.nextIndex[peerId] = reply.ConflictIndex
+			}
 		}
 
 		cm.nextIndex[peerId] = ni + len(entries)
@@ -354,6 +419,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 		if cm.commitIndex != savedCommitIndex {
 			cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
 			cm.newCommitReadyChan <- struct{}{}
+			cm.triggerChan <- struct{}{}
 		}
 	}
 
@@ -388,6 +454,48 @@ func (cm *ConsensusModule) commitChanSender() {
 func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 	format = fmt.Sprintf("[%d] ", cm.id) + format
 	log.Printf(format, args...)
+}
+
+// restoreFromState restores the persistent stat of this CM from storage.
+// its should be call during constructor, before any concurrency converts
+func (cm *ConsensusModule) restoreFromState(storage Storage) {
+	if termData, err := cm.storage.Get("currentTerm"); err != nil {
+		log.Fatal(err)
+	} else if err = gob.NewDecoder(bytes.NewBuffer(termData)).Decode(*&cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+
+	if votedFor, err := cm.storage.Get("votedFor"); err != nil {
+		log.Fatal(err)
+	} else if err = gob.NewDecoder(bytes.NewBuffer(votedFor)).Decode(&cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+
+	if logData, err := cm.storage.Get("log"); err != nil {
+		log.Fatal(err)
+	} else if err = gob.NewDecoder(bytes.NewBuffer(logData)).Decode(&cm.log); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func (cm *ConsensusModule) persistToStorage() {
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+
+	var votedFor bytes.Buffer
+	if err := gob.NewEncoder(&votedFor).Encode(cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("votedFor", votedFor.Bytes())
+
+	var logData bytes.Buffer
+	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("log", logData.Bytes())
 }
 
 func intMin(a, b int) int {

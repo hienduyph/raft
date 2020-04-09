@@ -53,6 +53,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// Faster conflict resolution optimization
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 // CommitEntry is the data reported by Raft to the commit channel.
