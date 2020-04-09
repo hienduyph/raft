@@ -54,3 +54,12 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 }
+
+// CommitEntry is the data reported by Raft to the commit channel.
+// Each commit channel entry notifies the client that consensus was reached on a command
+// and it can be applied to the client's state machine
+type CommitEntry struct {
+	Command interface{}
+	Index   int
+	Term    int
+}
